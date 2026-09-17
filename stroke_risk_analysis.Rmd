@@ -1,0 +1,683 @@
+---
+title: "Predicting Stroke from Health Data"
+author: "Balázs Margitai"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+pct = function(x) sprintf("%.1f%%", 100 * x)
+```
+
+In this project I use the Kaggle stroke dataset to predict which patients had a stroke. Only about 5% of the patients in the data had one, and a lot of the work is about that imbalance: a model can be 95% accurate and still miss every single stroke patient.
+
+I start with a logistic regression, fix the threshold problem, add a feature suggested by the exploratory analysis, and then compare the result with LDA and a random forest. Besides the usual classification metrics I also look at how well calibrated the predicted probabilities are, and I compare the models with repeated cross-validation instead of a single test split. A short summary is at the [end of the report](#summary).
+
+# 1. Data
+
+The data comes from the [Stroke Prediction Dataset](https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset) on Kaggle.
+
+```{r}
+stroke_data = read.csv("data/healthcare-dataset-stroke-data.csv")
+
+cat("Rows:", nrow(stroke_data), " Columns:", ncol(stroke_data), "\n\n")
+
+data.frame(column = names(stroke_data),
+           type = sapply(stroke_data, function(x) class(x)[1]),
+           distinct_values = sapply(stroke_data, function(x) length(unique(x))),
+           row.names = NULL)
+```
+
+The columns:
+
+- `age`, `avg_glucose_level` (mg/dL) and `bmi` are numeric
+- `hypertension` and `heart_disease` are 0/1
+- `gender`, `ever_married`, `work_type`, `Residence_type` and `smoking_status` are categories
+- `stroke` is the target (1 = the patient had a stroke)
+
+## Cleaning
+
+BMI is stored as text with "N/A" for missing values, so I convert it to a number first. I don't fill in the missing values here. That happens after the train-test split, so the test data has no influence on it.
+
+There is also a single patient with gender "Other". One row is not enough to learn anything about that group, and it breaks the gender coefficient in the logistic regression, so I drop it.
+
+```{r}
+cat("Missing or empty values per column:\n")
+print(sapply(stroke_data, function(x) sum(is.na(x) | x == "N/A" | x == "")))
+
+stroke_data$bmi = as.numeric(stroke_data$bmi)
+stroke_data = stroke_data[stroke_data$gender != "Other", ]
+stroke_data$id = NULL
+
+cat("\nRows after cleaning:", nrow(stroke_data), "\n")
+```
+
+# 2. Exploratory Analysis
+
+```{r}
+numeric_vars = c("age", "avg_glucose_level", "bmi")
+stroke_numeric = stroke_data[, numeric_vars]
+
+data.frame(
+  mean = round(sapply(stroke_numeric, mean, na.rm = TRUE), 1),
+  median = round(sapply(stroke_numeric, median, na.rm = TRUE), 1),
+  sd = round(sapply(stroke_numeric, sd, na.rm = TRUE), 1),
+  min = round(sapply(stroke_numeric, min, na.rm = TRUE), 1),
+  max = round(sapply(stroke_numeric, max, na.rm = TRUE), 1)
+)
+```
+
+Age goes from newborns to 82, with a mean of about 43. Glucose has a long right tail, and the average BMI is around 29.
+
+```{r}
+for (var in c("gender", "hypertension", "heart_disease", "smoking_status", "stroke")) {
+  cat("\n", var, "(%):\n")
+  print(round(prop.table(table(stroke_data[[var]])) * 100, 1))
+}
+```
+
+Only `r round(mean(stroke_data$stroke) * 100, 1)`% of the patients had a stroke. This is the most important thing to keep in mind for the modeling part.
+
+## Stroke rate by age
+
+Counting stroke cases per group would be misleading because the groups have very different sizes, so I look at the share of patients with a stroke in each group instead.
+
+```{r}
+library(ggplot2)
+
+stroke_rate_by = function(group, stroke) {
+  data.frame(
+    group = factor(names(table(group)), levels = levels(group)),
+    n = as.vector(table(group)),
+    stroke_rate = round(as.vector(tapply(stroke, group, mean)) * 100, 1)
+  )
+}
+
+theme_set(theme_minimal(base_size = 12))
+bar_color = "steelblue"
+overall_rate = mean(stroke_data$stroke) * 100
+dir.create("figures", showWarnings = FALSE)
+```
+
+```{r, fig.width = 8, fig.height = 4.5}
+age_group = cut(stroke_data$age, breaks = c(0, 20, 40, 50, 60, 70, 82), include.lowest = TRUE,
+                labels = c("0-20", "21-40", "41-50", "51-60", "61-70", "71-82"))
+age_rates = stroke_rate_by(age_group, stroke_data$stroke)
+age_rates
+
+age_plot = ggplot(age_rates, aes(x = group, y = stroke_rate)) +
+  geom_col(fill = bar_color, width = 0.6) +
+  geom_hline(yintercept = overall_rate, color = "gray50") +
+  annotate("text", x = 0.6, y = overall_rate, vjust = -0.5, hjust = 0, size = 3.5, color = "gray30",
+           label = sprintf("all patients: %.1f%%", overall_rate)) +
+  labs(title = "Stroke rate by age group", x = "Age group (years)", y = "Stroke rate (%)") +
+  theme(panel.grid.major.x = element_blank())
+
+age_plot
+ggsave("figures/stroke_rate_by_age.png", age_plot, width = 8, height = 4.5, dpi = 150, bg = "white")
+```
+
+The stroke rate is close to zero under 40 and climbs to `r max(age_rates$stroke_rate)`% in the oldest group.
+
+## Stroke rate by risk factor
+
+```{r, fig.width = 9, fig.height = 6}
+glucose_group = cut(stroke_data$avg_glucose_level, breaks = c(0, 100, 140, 200, Inf), right = FALSE,
+                    labels = c("< 100", "100-139", "140-199", ">= 200"))
+yes_no = function(x) factor(x, levels = 0:1, labels = c("No", "Yes"))
+
+risk_rates = rbind(
+  cbind(risk_factor = "Hypertension", stroke_rate_by(yes_no(stroke_data$hypertension), stroke_data$stroke)),
+  cbind(risk_factor = "Heart disease", stroke_rate_by(yes_no(stroke_data$heart_disease), stroke_data$stroke)),
+  cbind(risk_factor = "Glucose (mg/dL)", stroke_rate_by(glucose_group, stroke_data$stroke)),
+  cbind(risk_factor = "Smoking status",
+        stroke_rate_by(factor(stroke_data$smoking_status,
+                              levels = c("Unknown", "smokes", "formerly smoked", "never smoked")),
+                       stroke_data$stroke)),
+  cbind(risk_factor = "BMI",
+        stroke_rate_by(factor(ifelse(is.na(stroke_data$bmi), "missing", "recorded"),
+                              levels = c("recorded", "missing")),
+                       stroke_data$stroke))
+)
+# keep the panels in the order above
+risk_rates$risk_factor = factor(risk_rates$risk_factor, levels = unique(risk_rates$risk_factor))
+risk_rates
+
+risk_plot = ggplot(risk_rates, aes(x = stroke_rate, y = group)) +
+  geom_col(fill = bar_color, width = 0.6) +
+  geom_vline(xintercept = overall_rate, color = "gray50") +
+  facet_wrap(~ risk_factor, ncol = 2, scales = "free_y") +
+  labs(title = "Stroke rate by risk factor",
+       subtitle = sprintf("Gray line: all patients (%.1f%%)", overall_rate),
+       x = "Stroke rate (%)", y = NULL) +
+  theme(panel.grid.major.y = element_blank())
+
+risk_plot
+ggsave("figures/stroke_rate_by_risk_factor.png", risk_plot, width = 9, height = 6, dpi = 150, bg = "white")
+```
+
+Hypertension, heart disease and high glucose all come with clearly higher stroke rates. Two things surprised me: former smokers have a higher rate than current smokers, and patients with a missing BMI have a stroke rate of about 20%. Both are probably partly about age (former smokers and patients with incomplete records tend to be older). The missing BMI pattern is strong enough that I come back to it in the modeling part.
+
+## Correlations
+
+```{r, fig.width = 6, fig.height = 5}
+library(corrplot)
+
+cor_matrix = cor(stroke_numeric, use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper", addCoef.col = "black",
+         tl.col = "black", tl.srt = 45)
+```
+
+The numeric variables are only weakly correlated (the strongest pair is age and BMI at `r round(cor_matrix["age", "bmi"], 2)`), so collinearity isn't a concern for the models.
+
+# 3. Logistic Regression
+
+```{r}
+library(caret)
+set.seed(123)
+
+stroke_log = stroke_data
+for (col in c("gender", "ever_married", "work_type", "Residence_type", "smoking_status")) {
+  stroke_log[[col]] = as.factor(stroke_log[[col]])
+}
+stroke_log$stroke = factor(stroke_log$stroke, levels = c(0, 1), labels = c("No", "Yes"))
+# recorded before imputation, used as a feature later
+stroke_log$bmi_missing = as.integer(is.na(stroke_log$bmi))
+```
+
+## Train-test split
+
+I use a stratified 70/30 split, so both parts keep the same share of stroke patients. Missing BMI values are filled with the median BMI of the training set.
+
+```{r}
+train_index = createDataPartition(stroke_log$stroke, p = 0.7, list = FALSE)
+train_data = stroke_log[train_index, ]
+test_data = stroke_log[-train_index, ]
+
+bmi_median = median(train_data$bmi, na.rm = TRUE)
+train_data$bmi[is.na(train_data$bmi)] = bmi_median
+test_data$bmi[is.na(test_data$bmi)] = bmi_median
+
+table(train_data$stroke)
+table(test_data$stroke)
+test_strokes = sum(test_data$stroke == "Yes")
+```
+
+## Base model
+
+```{r}
+logit_formula = stroke ~ age + hypertension + heart_disease +
+  avg_glucose_level + bmi + gender + smoking_status
+
+logit_model = glm(logit_formula, data = train_data, family = binomial)
+summary(logit_model)
+```
+
+```{r}
+odds_ratios = exp(coef(logit_model))
+round(cbind(odds_ratio = odds_ratios, exp(confint(logit_model))), 3)
+
+p_values = coef(summary(logit_model))[, 4]
+```
+
+Age is the strongest predictor: every extra year multiplies the odds of stroke by `r round(odds_ratios["age"], 3)`, which is about `r round((odds_ratios["age"] - 1) * 100, 1)`% higher odds per year. Glucose level is also significant (p = `r signif(p_values["avg_glucose_level"], 2)`). Hypertension (p = `r round(p_values["hypertension"], 2)`) and heart disease (p = `r round(p_values["heart_disease"], 2)`) are not, even though their raw stroke rates were much higher. They overlap a lot with age, and once age is in the model there isn't much left for them to explain.
+
+## The 0.5 threshold problem
+
+The model gives a probability for each patient, and the usual rule is to predict "stroke" above 0.5.
+
+```{r}
+logit_pred_prob = predict(logit_model, newdata = test_data, type = "response")
+logit_pred_class = factor(ifelse(logit_pred_prob > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+cm_logit = confusionMatrix(logit_pred_class, test_data$stroke, positive = "Yes")
+cm_logit
+```
+
+With 0.5 the model predicts "no stroke" for everyone, because the highest predicted probability in the test set is only `r round(max(logit_pred_prob), 2)`. Accuracy is still `r pct(cm_logit$overall["Accuracy"])`, simply because most patients didn't have a stroke.
+
+```{r, fig.width = 6, fig.height = 5}
+library(pROC)
+
+roc_obj = roc(test_data$stroke, logit_pred_prob, quiet = TRUE)
+auc_value = auc(roc_obj)
+plot(roc_obj, main = paste("ROC curve, AUC =", round(auc_value, 3)))
+```
+
+The AUC is `r round(auc_value, 2)`, so the model ranks patients reasonably well. The ranking is fine; the 0.5 cutoff is what doesn't work.
+
+## Choosing a better threshold
+
+To pick a cutoff without looking at the test set, I run 5-fold cross-validation on the training data. Every training patient gets a predicted probability from a model that wasn't trained on them, and I choose the threshold with the best F1 score on those out-of-fold predictions.
+
+```{r, fig.width = 7, fig.height = 4.5}
+f1_at_threshold = function(prob, actual, threshold) {
+  pred_yes = prob >= threshold
+  is_yes = actual == "Yes"
+  tp = sum(pred_yes & is_yes)
+  fp = sum(pred_yes & !is_yes)
+  fn = sum(!pred_yes & is_yes)
+  if (tp == 0) return(0)
+  2 * tp / (2 * tp + fp + fn)
+}
+
+thresholds = seq(0.01, 0.50, by = 0.01)
+best_f1_threshold = function(prob, actual) {
+  f1_scores = sapply(thresholds, function(t) f1_at_threshold(prob, actual, t))
+  thresholds[which.max(f1_scores)]
+}
+
+set.seed(123)
+folds = createFolds(train_data$stroke, k = 5)
+oof_glm = function(formula) {
+  prob = numeric(nrow(train_data))
+  for (fold in folds) {
+    fold_model = glm(formula, data = train_data[-fold, ], family = binomial)
+    prob[fold] = predict(fold_model, newdata = train_data[fold, ], type = "response")
+  }
+  prob
+}
+
+oof_prob = oof_glm(logit_formula)
+best_threshold = best_f1_threshold(oof_prob, train_data$stroke)
+
+f1_scores = sapply(thresholds, function(t) f1_at_threshold(oof_prob, train_data$stroke, t))
+plot(thresholds, f1_scores, type = "l", xlab = "Threshold", ylab = "F1 (out-of-fold)",
+     main = paste("Best threshold:", best_threshold))
+abline(v = best_threshold, lty = 2)
+```
+
+```{r}
+logit_pred_tuned = factor(ifelse(logit_pred_prob >= best_threshold, "Yes", "No"), levels = c("No", "Yes"))
+
+cm_tuned = confusionMatrix(logit_pred_tuned, test_data$stroke, positive = "Yes", mode = "everything")
+cm_tuned
+```
+
+With a threshold of `r best_threshold` the model finds `r cm_tuned$table["Yes", "Yes"]` of the `r test_strokes` stroke patients in the test set. The price is a lot of false alarms: the precision is `r pct(cm_tuned$byClass["Precision"])`, so only about one in five flagged patients actually had a stroke.
+
+When the positive class is this rare, the precision-recall curve is more informative than the ROC curve. A random model would get a PR-AUC equal to the stroke rate (about 0.05).
+
+```{r, fig.width = 6, fig.height = 5}
+library(PRROC)
+
+pr = pr.curve(scores.class0 = logit_pred_prob[test_data$stroke == "Yes"],
+              scores.class1 = logit_pred_prob[test_data$stroke == "No"],
+              curve = TRUE)
+plot(pr, main = paste("Precision-recall curve, PR-AUC =", round(pr$auc.integral, 3)))
+```
+
+## Feature engineering
+
+The exploratory analysis suggested two things to try. Patients with a missing BMI had a much higher stroke rate, so the fact that BMI is missing might carry information that the median imputation throws away. And the age effect might not be linear on the log-odds scale, so I also try adding a squared age term. I add each idea to the base model separately and compare them with likelihood-ratio tests.
+
+```{r}
+flag_formula = update(logit_formula, . ~ . + bmi_missing)
+quadratic_formula = update(logit_formula, . ~ . + I(age^2))
+
+logit_flag = glm(flag_formula, data = train_data, family = binomial)
+logit_quadratic = glm(quadratic_formula, data = train_data, family = binomial)
+
+data.frame(model = c("base", "base + BMI missing flag", "base + squared age"),
+           AIC = round(c(AIC(logit_model), AIC(logit_flag), AIC(logit_quadratic)), 1))
+
+flag_test = anova(logit_model, logit_flag, test = "Chisq")
+quadratic_test = anova(logit_model, logit_quadratic, test = "Chisq")
+flag_test
+quadratic_test
+```
+
+The missing-BMI flag clearly improves the model: AIC drops by `r round(AIC(logit_model) - AIC(logit_flag), 1)` and the likelihood-ratio test gives p = `r format.pval(flag_test[["Pr(>Chi)"]][2], digits = 2)`. Even after adjusting for age and the other variables, patients without a recorded BMI have `r round(exp(coef(logit_flag)["bmi_missing"]), 1)` times higher odds of stroke. My guess is that a missing measurement often means a patient who was too ill or too urgent to be measured, but the data can't confirm that.
+
+The squared age term doesn't help either (p = `r round(quadratic_test[["Pr(>Chi)"]][2], 2)`), so age stays linear. That also fits the exploratory chart, where the stroke rate rises steadily with age. From here on, all models use the feature set with the flag.
+
+```{r}
+flag_oof_prob = oof_glm(flag_formula)
+flag_best_threshold = best_f1_threshold(flag_oof_prob, train_data$stroke)
+
+flag_test_prob = predict(logit_flag, newdata = test_data, type = "response")
+flag_pred_tuned = factor(ifelse(flag_test_prob >= flag_best_threshold, "Yes", "No"), levels = c("No", "Yes"))
+
+cm_flag = confusionMatrix(flag_pred_tuned, test_data$stroke, positive = "Yes", mode = "everything")
+cm_flag
+```
+
+On this test set the model with the flag finds `r cm_flag$table["Yes", "Yes"]` of the `r test_strokes` stroke patients at a threshold of `r flag_best_threshold`. One split with 74 stroke patients is noisy, so whether the flag really helps is checked with repeated cross-validation in section 7.
+
+# 4. Linear Discriminant Analysis
+
+LDA is a classic alternative to logistic regression. It assumes that within each class the predictors are normally distributed with the same covariance, and uses Bayes' rule to turn that into a probability of stroke. It gets the same features, split, folds and threshold search as the logistic regression, so the two can be compared directly.
+
+R turns the categorical variables into 0/1 dummy columns automatically: one column per category, minus a reference category. Coding them as 1, 2, 3, 4 instead would pretend the categories have an order. The made-up example below shows the idea for smoking status, where "formerly smoked" is the reference.
+
+```{r}
+library(MASS)
+
+dummy_example = data.frame(smoking_status = factor(c("never smoked", "smokes", "Unknown", "formerly smoked")))
+model.matrix(~ smoking_status, data = dummy_example)
+```
+
+```{r, fig.width = 10, fig.height = 3.5}
+par(mfrow = c(1, 3))
+for (var in numeric_vars) {
+  # shapiro.test accepts at most 5000 values
+  shapiro_p = shapiro.test(sample(train_data[[var]], min(5000, nrow(train_data))))$p.value
+  hist(train_data[[var]], breaks = 30, col = "lightblue", xlab = var,
+       main = sprintf("%s (Shapiro p = %.3g)", var, shapiro_p))
+}
+```
+
+None of the numeric variables look normal, and the Shapiro-Wilk test agrees. The binary and dummy columns can't be normal either, so LDA's assumptions don't really hold here. I still include it as a comparison.
+
+```{r}
+lda_model = lda(flag_formula, data = train_data)
+lda_model
+```
+
+```{r}
+lda_oof_prob = numeric(nrow(train_data))
+for (fold in folds) {
+  fold_model = lda(flag_formula, data = train_data[-fold, ])
+  lda_oof_prob[fold] = predict(fold_model, newdata = train_data[fold, ])$posterior[, "Yes"]
+}
+lda_best_threshold = best_f1_threshold(lda_oof_prob, train_data$stroke)
+
+lda_test_prob = predict(lda_model, newdata = test_data)$posterior[, "Yes"]
+lda_pred_tuned = factor(ifelse(lda_test_prob >= lda_best_threshold, "Yes", "No"), levels = c("No", "Yes"))
+
+cm_lda = confusionMatrix(lda_pred_tuned, test_data$stroke, positive = "Yes", mode = "everything")
+cm_lda
+```
+
+LDA's best threshold is `r lda_best_threshold`, and it finds `r cm_lda$table["Yes", "Yes"]` of the `r test_strokes` stroke patients.
+
+# 5. Random Forest
+
+A random forest builds many decision trees on bootstrap samples of the data and averages their predictions. Unlike the other two models, it can pick up non-linear effects and interactions without me specifying them. I use the `ranger` package with 500 trees and the default settings.
+
+```{r}
+library(ranger)
+
+set.seed(123)
+rf_model = ranger(flag_formula, data = train_data, num.trees = 500,
+                  probability = TRUE, importance = "permutation")
+rf_model
+```
+
+Each tree skips about a third of the training patients, so the forest can predict every training patient using only the trees that didn't see them. I use these out-of-bag predictions to choose the threshold, the same way I used cross-validation for the other models.
+
+```{r}
+rf_oob_prob = rf_model$predictions[, "Yes"]
+rf_best_threshold = best_f1_threshold(rf_oob_prob, train_data$stroke)
+
+rf_test_prob = predict(rf_model, data = test_data)$predictions[, "Yes"]
+rf_pred_tuned = factor(ifelse(rf_test_prob >= rf_best_threshold, "Yes", "No"), levels = c("No", "Yes"))
+
+cm_rf = confusionMatrix(rf_pred_tuned, test_data$stroke, positive = "Yes", mode = "everything")
+cm_rf
+```
+
+```{r, fig.width = 7, fig.height = 4}
+par(mar = c(5, 10, 3, 2))
+barplot(sort(importance(rf_model)), horiz = TRUE, las = 1, col = "steelblue",
+        main = "Permutation importance", xlab = "Increase in prediction error")
+```
+
+Age is by far the most important variable for the forest. Permutation importance on a probability forest is measured with the Brier score, and with so few stroke cases the smaller values are close to noise, so I only read the top of this chart. Random forests also tend to favor continuous variables that have many possible split points.
+
+## All models on the test set
+
+```{r}
+model_metrics = function(prob, pred, actual) {
+  cm = confusionMatrix(pred, actual, positive = "Yes", mode = "everything")
+  c(AUC = as.numeric(auc(roc(actual, prob, quiet = TRUE))),
+    PR_AUC = pr.curve(scores.class0 = prob[actual == "Yes"],
+                      scores.class1 = prob[actual == "No"])$auc.integral,
+    Brier = mean((prob - (actual == "Yes"))^2),
+    Recall = unname(cm$byClass["Recall"]),
+    Precision = unname(cm$byClass["Precision"]),
+    F1 = unname(cm$byClass["F1"]))
+}
+
+comparison = rbind(
+  "Logistic regression (base)" = c(Threshold = best_threshold,
+                                   model_metrics(logit_pred_prob, logit_pred_tuned, test_data$stroke)),
+  "Logistic regression + BMI flag" = c(Threshold = flag_best_threshold,
+                                       model_metrics(flag_test_prob, flag_pred_tuned, test_data$stroke)),
+  "LDA" = c(Threshold = lda_best_threshold,
+            model_metrics(lda_test_prob, lda_pred_tuned, test_data$stroke)),
+  "Random forest" = c(Threshold = rf_best_threshold,
+                      model_metrics(rf_test_prob, rf_pred_tuned, test_data$stroke))
+)
+round(comparison, 3)
+```
+
+On a single test set the models are close, and the differences between them are within the range that a few patients can change. Section 7 compares them more reliably.
+
+# 6. Calibration and Threshold Choice
+
+## Calibration
+
+A model can rank patients well and still give probabilities that are too high or too low. If the output is going to be read as a risk ("this patient has a 15% chance"), that matters. To check it, I sort the test patients by predicted risk, split them into ten equal groups, and compare the average predicted risk with the actual stroke rate in each group.
+
+```{r, fig.width = 7, fig.height = 5.5}
+calibration_bins = function(prob, actual, model_name, bins = 10) {
+  bin = cut(prob, breaks = unique(quantile(prob, probs = seq(0, 1, length.out = bins + 1))),
+            include.lowest = TRUE)
+  data.frame(model = model_name,
+             predicted = as.vector(tapply(prob, bin, mean)) * 100,
+             observed = as.vector(tapply(actual == "Yes", bin, mean)) * 100)
+}
+
+calibration = rbind(
+  calibration_bins(flag_test_prob, test_data$stroke, "Logistic regression + BMI flag"),
+  calibration_bins(rf_test_prob, test_data$stroke, "Random forest")
+)
+
+calibration_plot = ggplot(calibration, aes(x = predicted, y = observed, color = model)) +
+  geom_abline(slope = 1, intercept = 0, color = "gray60") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("#2a78d6", "#eb6834")) +
+  labs(title = "Calibration on the test set",
+       subtitle = "Test patients in ten groups by predicted risk",
+       x = "Average predicted risk (%)", y = "Observed stroke rate (%)", color = NULL) +
+  theme(legend.position = "bottom")
+
+calibration_plot
+ggsave("figures/calibration.png", calibration_plot, width = 7, height = 5.5, dpi = 150, bg = "white")
+```
+
+Points on the gray line mean the predicted risk matches reality. The Brier score summarizes this in one number (the mean squared difference between the predicted probability and the actual 0/1 outcome, lower is better): `r round(comparison["Logistic regression + BMI flag", "Brier"], 4)` for the logistic regression and `r round(comparison["Random forest", "Brier"], 4)` for the random forest. For reference, always predicting the overall stroke rate would give about `r round(overall_rate / 100 * (1 - overall_rate / 100), 4)`. The highest risk groups contain only a handful of stroke patients, so the right end of the chart is noisy.
+
+## A threshold for screening
+
+The F1 threshold treats a missed stroke and a false alarm roughly the same. If this were used for screening, missing a stroke patient would be much worse than sending someone for an extra check. As an alternative I pick the highest threshold that still reaches 80% recall on the out-of-fold training predictions, and see what it costs on the test set.
+
+```{r}
+threshold_for_recall = function(prob, actual, target_recall) {
+  recall = sapply(thresholds, function(t) mean(prob[actual == "Yes"] >= t))
+  max(thresholds[recall >= target_recall])
+}
+
+screen_threshold = threshold_for_recall(flag_oof_prob, train_data$stroke, 0.8)
+
+threshold_summary = function(threshold) {
+  pred_yes = flag_test_prob >= threshold
+  is_yes = test_data$stroke == "Yes"
+  c(threshold = threshold,
+    recall = mean(pred_yes[is_yes]),
+    precision = mean(is_yes[pred_yes]),
+    share_flagged = mean(pred_yes))
+}
+
+threshold_options = rbind("max F1" = threshold_summary(flag_best_threshold),
+                          "80% recall" = threshold_summary(screen_threshold))
+round(threshold_options, 3)
+```
+
+With the screening threshold of `r screen_threshold` the model catches `r pct(threshold_options["80% recall", "recall"])` of the stroke patients in the test set, but it flags `r pct(threshold_options["80% recall", "share_flagged"])` of all patients and the precision drops to `r pct(threshold_options["80% recall", "precision"])`. Which one is better depends on how expensive a follow-up check is compared with a missed stroke, and that has to be decided by whoever would use the model.
+
+# 7. Repeated Cross-Validation
+
+One test set with `r test_strokes` stroke patients is small: a few patients more or less can move recall by several percentage points. To get more stable numbers, I repeat the whole process with 5-fold cross-validation, 10 times, which gives 50 results per model. Inside each fold, the BMI median and the F1 threshold are computed from that fold's training part only (the threshold with an inner 5-fold cross-validation), so the held-out part is never used for any decision.
+
+```{r}
+impute_bmi = function(train, test) {
+  bmi_median = median(train$bmi, na.rm = TRUE)
+  train$bmi[is.na(train$bmi)] = bmi_median
+  test$bmi[is.na(test$bmi)] = bmi_median
+  list(train = train, test = test)
+}
+
+# each fit_predict function trains on `train` and returns P(stroke) for `test`
+fit_predict_glm = function(formula) {
+  function(train, test) {
+    model = glm(formula, data = train, family = binomial)
+    predict(model, newdata = test, type = "response")
+  }
+}
+
+fit_predict_lda = function(train, test) {
+  model = lda(flag_formula, data = train)
+  predict(model, newdata = test)$posterior[, "Yes"]
+}
+
+fit_predict_rf = function(train, test) {
+  model = ranger(flag_formula, data = train, num.trees = 500, probability = TRUE)
+  predict(model, data = test)$predictions[, "Yes"]
+}
+
+choose_threshold = function(train, fit_predict) {
+  inner_folds = createFolds(train$stroke, k = 5)
+  prob = numeric(nrow(train))
+  for (fold in inner_folds) {
+    prob[fold] = fit_predict(train[-fold, ], train[fold, ])
+  }
+  best_f1_threshold(prob, train$stroke)
+}
+```
+
+```{r}
+set.seed(2024)
+n_repeats = 10
+k_outer = 5
+models = list("Logistic regression (base)" = fit_predict_glm(logit_formula),
+              "Logistic regression + BMI flag" = fit_predict_glm(flag_formula),
+              "LDA" = fit_predict_lda,
+              "Random forest" = fit_predict_rf)
+
+cv_results = list()
+for (r in 1:n_repeats) {
+  outer_folds = createFolds(stroke_log$stroke, k = k_outer)
+  for (f in seq_along(outer_folds)) {
+    fold_data = impute_bmi(stroke_log[-outer_folds[[f]], ], stroke_log[outer_folds[[f]], ])
+    for (model_name in names(models)) {
+      fit_predict = models[[model_name]]
+      threshold = choose_threshold(fold_data$train, fit_predict)
+      prob = fit_predict(fold_data$train, fold_data$test)
+      pred = factor(ifelse(prob >= threshold, "Yes", "No"), levels = c("No", "Yes"))
+      cv_results[[length(cv_results) + 1]] = data.frame(
+        repeat_id = r, fold = f, model = model_name,
+        t(model_metrics(prob, pred, fold_data$test$stroke))
+      )
+    }
+  }
+}
+cv_results = do.call(rbind, cv_results)
+```
+
+```{r}
+metric_cols = c("AUC", "PR_AUC", "Brier", "Recall", "Precision", "F1")
+mean_sd = function(x) sprintf("%.3f ± %.3f", mean(x), sd(x))
+
+cv_summary = sapply(split(cv_results[, metric_cols], cv_results$model),
+                    function(df) sapply(df, mean_sd))
+noquote(t(cv_summary))
+```
+
+```{r, fig.width = 10, fig.height = 4.5}
+cv_long = rbind(
+  data.frame(model = cv_results$model, metric = "PR-AUC", value = cv_results$PR_AUC),
+  data.frame(model = cv_results$model, metric = "F1", value = cv_results$F1)
+)
+
+ggplot(cv_long, aes(x = value, y = model)) +
+  geom_boxplot(fill = "lightblue", outlier.size = 1) +
+  facet_wrap(~ metric, scales = "free_x") +
+  labs(title = "Results across 50 cross-validation folds", x = NULL, y = NULL)
+```
+
+## Comparing the models fold by fold
+
+All models were evaluated on the same folds, so I compare them fold by fold using the difference in each metric. A regular paired t-test would be too optimistic here: the training sets of different folds share most of their patients, so the 50 results are not independent. I use the corrected resampled t-test from Nadeau and Bengio (2003), which inflates the variance to account for that overlap.
+
+```{r}
+corrected_t_test = function(d, test_train_ratio) {
+  J = length(d)
+  se = sqrt((1 / J + test_train_ratio) * var(d))
+  t_stat = mean(d) / se
+  list(t = t_stat, p_value = 2 * pt(-abs(t_stat), df = J - 1))
+}
+
+compare_models = function(model_a, model_b, metric) {
+  d = cv_results[cv_results$model == model_a, metric] - cv_results[cv_results$model == model_b, metric]
+  test = corrected_t_test(d, test_train_ratio = 1 / (k_outer - 1))
+  data.frame(comparison = paste(model_a, "vs", model_b), metric = metric,
+             mean_difference = round(mean(d), 4), a_better_in = sum(d > 0),
+             t = round(test$t, 2), p_value = round(test$p_value, 3))
+}
+
+final_model = "Logistic regression + BMI flag"
+pairwise = do.call(rbind, lapply(c("Logistic regression (base)", "LDA", "Random forest"), function(other) {
+  do.call(rbind, lapply(c("AUC", "PR_AUC", "F1"), function(metric) compare_models(final_model, other, metric)))
+}))
+pairwise
+```
+
+`a_better_in` is the number of folds (out of `r n_repeats * k_outer`) in which the logistic regression with the BMI flag scored higher.
+
+```{r, echo = FALSE}
+pairwise_row = function(other, metric) pairwise[pairwise$comparison == paste(final_model, "vs", other) & pairwise$metric == metric, ]
+```
+
+Compared with the base logistic regression, the flag gives a small but consistent AUC gain: it is better in `r pairwise_row("Logistic regression (base)", "AUC")$a_better_in` of the 50 folds (p = `r pairwise_row("Logistic regression (base)", "AUC")$p_value`). The PR-AUC and F1 gains point the same way but are within the noise. Against LDA and the random forest none of the differences reach p < 0.05, and on PR-AUC the random forest is practically tied with it. So the extra complexity of the random forest doesn't buy anything on this data.
+
+# 8. Summary {#summary}
+
+```{r, echo = FALSE}
+cv_mean = function(model, metric) mean(cv_results[cv_results$model == model, metric])
+cv_p = function(other, metric) pairwise$p_value[pairwise$comparison == paste(final_model, "vs", other) &
+                                                  pairwise$metric == metric]
+```
+
+Age is by far the strongest factor: the stroke rate goes from `r age_rates$stroke_rate[1]`% in the youngest group to `r max(age_rates$stroke_rate)`% in the oldest, and each extra year multiplies the odds of stroke by `r round(odds_ratios["age"], 3)`. Glucose level also matters. A missing BMI turned out to be a strong signal as well, with `r round(exp(coef(logit_flag)["bmi_missing"]), 1)` times higher odds after adjusting for everything else.
+
+The class imbalance was the main practical problem. With the default 0.5 threshold the base logistic regression is `r pct(cm_logit$overall["Accuracy"])` accurate and finds `r cm_logit$table["Yes", "Yes"]` of the `r test_strokes` stroke patients in the test set. Choosing the threshold by cross-validation on the training data (`r best_threshold`) brings that to `r cm_tuned$table["Yes", "Yes"]`. For screening, a threshold aimed at 80% recall catches `r pct(threshold_options["80% recall", "recall"])` of stroke patients but flags `r pct(threshold_options["80% recall", "share_flagged"])` of everyone.
+
+In `r n_repeats` × `r k_outer` cross-validation, adding the missing-BMI flag raised the mean PR-AUC of the logistic regression from `r round(cv_mean("Logistic regression (base)", "PR_AUC"), 3)` to `r round(cv_mean(final_model, "PR_AUC"), 3)` (corrected p = `r cv_p("Logistic regression (base)", "PR_AUC")`) and the mean AUC from `r round(cv_mean("Logistic regression (base)", "AUC"), 3)` to `r round(cv_mean(final_model, "AUC"), 3)` (p = `r cv_p("Logistic regression (base)", "AUC")`). Its mean F1 was `r round(cv_mean(final_model, "F1"), 3)`, compared with `r round(cv_mean("LDA", "F1"), 3)` for LDA and `r round(cv_mean("Random forest", "F1"), 3)` for the random forest. LDA and the random forest did not improve on it, so I would use the logistic regression with the BMI flag: it performs at least as well as the other models, it is reasonably calibrated, and its coefficients are easy to explain.
+
+## Limitations
+
+- This is observational data, so everything here is an association. The raw group comparisons in particular are mixed up with age, and I can only guess why a missing BMI is linked to stroke.
+- Precision stays around `r pct(cv_mean(final_model, "Precision"))` with the F1 threshold. A model like this could be a first screening step at best, not something that makes decisions on its own.
+- About `r round(mean(stroke_data$smoking_status == "Unknown") * 100)`% of the smoking status values are "Unknown".
+- The random forest was not tuned, and everything is based on a single dataset without external validation.
+
+## Next steps
+
+- Tune the random forest (or try gradient boosting) inside the same nested cross-validation.
+- Use class weights as an alternative to threshold tuning and compare the two approaches.
+- Choose the threshold from actual costs of a missed stroke and a follow-up check, if those can be estimated.
+- Validate the final model on data from a different source.
+
+## Session info
+
+```{r}
+sessionInfo()
+```
